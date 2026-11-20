@@ -8,7 +8,14 @@
 // Minting a fresh RoundData(def) keeps every chambered round live and leaves manual
 // unloading untouched.
 //
-// Coverage, mag-fed path: standard magazine-fed + bolt guns feed through this hook.
+// Coverage, mag-fed path: standard magazine-fed + self-loading guns feed through this hook
+// (CyclicBolt.Breech.LoadRoundFromMagazine). Bolt-action guns use a different breech class
+// (BoltAction.BoltActionBreech) and feed via LoadRoundFromOwnMagazine, so they get their own
+// identical top-up hook. Tube-fed pump/lever shotguns are CyclicBolt guns too (manual-cycled,
+// main spring disabled), but chamber off a shell lifter (MagazineCarrierLifter.RoundCarrier)
+// via LoadRoundFromRoundCarrier -- a third feed path -- so they get a third top-up hook that
+// refills the carrier. Each hook mints a fresh round back into whatever feed device it just
+// drew from, so no gun family runs dry.
 //
 // Breach loaders (break actions, derringers, trapdoor/rolling/falling-block single shots)
 // have no magazine -- you hand-load rounds straight into chambers, and after firing the
@@ -30,6 +37,10 @@
 // return true, which re-enables toggling dupe mode on any pocket (press Primary/A-X while
 // hovering it). The game's own per-item rules still apply, so guns stay non-dupeable while
 // ammo, grenades, toys and powerups can be duplicated.
+//
+// No recoil: the Recoil component applies felt kick + muzzle climb through four public impulse
+// methods; we no-op all four so the recoil sim never integrates anything. This is felt recoil
+// only -- blowback/bolt cycling runs off the breech's own momentum, so auto guns still cycle.
 //
 // All addresses are the dump.cs RVA field, added to the libil2cpp.so load base.
 
@@ -60,7 +71,16 @@ static constexpr std::uintptr_t RVA_Fire             = 0x4DE3390; // FirearmBase
 static constexpr std::uintptr_t RVA_RevolverAwake    = 0x4E21DE8; // Revolver.Awake() -- cache the class on spawn
 static constexpr std::uintptr_t RVA_ChamberLoadedRnd = 0x4E6B878; // Chamber.LoadedRound():RoundData
 static constexpr std::uintptr_t RVA_SpawnLockAllowed = 0x4C76E8C; // Pocket.SpawnLockAllowed():bool (static gate)
-static constexpr std::size_t MAG_ROUNDHOLDER_OFFSET  = 0x260;     // Magazine.roundHolder
+static constexpr std::uintptr_t RVA_LoadRoundFromOwnMag  = 0x4E6E30C; // BoltAction.BoltActionBreech.LoadRoundFromOwnMagazine(int):bool
+static constexpr std::uintptr_t RVA_LoadRoundFromCarrier = 0x4E7DA44; // CyclicBolt.Breech.LoadRoundFromRoundCarrier(RoundCarrier):bool (pump/tube shell lifter)
+// no-recoil: the four public impulse entry points on the Recoil MonoBehaviour (felt recoil only)
+static constexpr std::uintptr_t RVA_RecoilAtPos  = 0x4E179C0; // Recoil.AddRecoilImpulseAtPosition(Vector3,Vector3)
+static constexpr std::uintptr_t RVA_RecoilLinear = 0x4E1D650; // Recoil.AddRecoilLinearImpulse(Vector3)
+static constexpr std::uintptr_t RVA_RecoilAngular= 0x4E1D8F0; // Recoil.AddRecoilAngularImpulse(Vector3)
+static constexpr std::uintptr_t RVA_RecoilLinAng = 0x4E1DB6C; // Recoil.AddRecoilLinearAndAngularImpulse(Vector3,Vector3)
+static constexpr std::size_t MAG_ROUNDHOLDER_OFFSET     = 0x260;    // Magazine.roundHolder
+static constexpr std::size_t BABREECH_CONNMAG_OFFSET    = 0x60;     // BoltAction.BoltActionBreech.connectedMagazine
+static constexpr std::size_t CARRIER_CONNMAG_OFFSET     = 0x20;     // MagazineCarrierLifter.RoundCarrier.connectedMagazine (tube source)
 static constexpr std::size_t ROUNDDATA_DEF_OFFSET    = 0x10;      // RoundData.def (ItemDef)
 static constexpr std::size_t ROUNDDATA_FIRED_OFFSET  = 0x20;      // RoundData.fired (bool)
 static constexpr std::size_t ARRAY_COUNT_OFFSET      = 0x18;      // Il2CppArray.max_length (64-bit)
@@ -89,6 +109,8 @@ typedef void  (*Fire_t)(void* self, void* chamber, void* barrel, void* method);
 typedef void  (*RevAwake_t)(void* self, void* method);
 typedef void* (*LoadedRound_t)(void* chamber, void* method);
 typedef bool  (*SpawnLockAllowed_t)(void* method);
+typedef bool  (*LRFOM_t)(void* self, int index, void* method);
+typedef bool  (*LRFRC_t)(void* self, void* carrier, void* method);
 
 static LRFM_t            LRFM_orig         = nullptr;
 static GetRound_t        p_GetRound        = nullptr;
@@ -101,11 +123,15 @@ static Fire_t            Fire_orig         = nullptr;
 static RevAwake_t        RevAwake_orig     = nullptr;
 static LoadedRound_t     p_LoadedRound     = nullptr;
 static SpawnLockAllowed_t SLA_orig         = nullptr;
+static LRFOM_t           LRFOM_orig        = nullptr;
+static LRFRC_t           LRFRC_orig        = nullptr;
 static void*             g_revolverClass   = nullptr;
 static bool              g_logged          = false;
 static bool              g_loggedBreach    = false;
 static bool              g_loggedRevolver  = false;
 static bool              g_loggedSpawnLock = false;
+static bool              g_loggedBolt      = false;
+static bool              g_loggedTube      = false;
 
 // Mint a fresh live RoundData of the same type as `tmpl` and drop it into `holder`.
 static void topUp(void* holder, void* tmpl) {
@@ -126,6 +152,46 @@ static bool LoadRoundFromMagazine_hook(void* self, void* mag, int index, void* m
     if (result && tmpl) {
         topUp(holder, tmpl);                                                          // replace it with a fresh live round
         if (!g_logged) { LOGI("fed + topped up magazine with a fresh round"); g_logged = true; }
+    }
+    return result;
+}
+
+// Bolt-action + pump guns are a DIFFERENT breech class (BoltAction.BoltActionBreech) than the
+// CyclicBolt one the mag-feed hook above covers, so their integral tube/magazine never saw a
+// top-up and ran dry. When the action cycles, the breech chambers from its connected magazine
+// via LoadRoundFromOwnMagazine(int); we top that magazine back up with a fresh round after each
+// feed, exactly like the mag-fed path. Covers pump shotguns and any bolt gun with an internal
+// or detachable magazine.
+static bool LoadRoundFromOwnMagazine_hook(void* self, int index, void* method) {
+    void* mag    = self ? *reinterpret_cast<void**>(reinterpret_cast<char*>(self) + BABREECH_CONNMAG_OFFSET) : nullptr;
+    void* holder = mag  ? *reinterpret_cast<void**>(reinterpret_cast<char*>(mag) + MAG_ROUNDHOLDER_OFFSET) : nullptr;
+    void* tmpl   = (holder && p_GetRound) ? p_GetRound(holder, 0, nullptr) : nullptr; // peek a round for its type
+    bool  result = LRFOM_orig(self, index, method);                                   // let the cycle chamber (depletes mag by 1)
+    if (result && tmpl) {
+        topUp(holder, tmpl);                                                          // replace it with a fresh live round
+        if (!g_loggedBolt) { LOGI("bolt/pump: fed + topped up connected magazine"); g_loggedBolt = true; }
+    }
+    return result;
+}
+
+// Tube-fed pump/lever shotguns chamber off a MagazineCarrierLifter.RoundCarrier (the shell
+// lifter) via CyclicBolt.Breech.LoadRoundFromRoundCarrier, and the lifter is fed one shell per
+// manual stroke from its connected tube magazine (RoundCarrier.connectedMagazine, 0x20). We must
+// NOT refill the lifter itself: it is a physical object, and keeping it full makes the gun
+// re-chamber continuously, spawning duplicate round objects (dead hands, phantom spawner counts).
+// Instead, after each chamber, top up the upstream TUBE magazine -- the same passive-magazine
+// refill the mag-fed/bolt hooks already use safely -- so every stroke has a shell to lift and the
+// gun never runs dry, with no physical duplication. If a gun's tube isn't a Magazine the refill
+// simply no-ops (that gun empties, but nothing breaks). Matt: needs >=1 shell left for the type;
+// load the tube, not a single shell.
+static bool LoadRoundFromRoundCarrier_hook(void* self, void* carrier, void* method) {
+    void* mag    = carrier ? *reinterpret_cast<void**>(reinterpret_cast<char*>(carrier) + CARRIER_CONNMAG_OFFSET) : nullptr; // tube
+    void* holder = mag     ? *reinterpret_cast<void**>(reinterpret_cast<char*>(mag) + MAG_ROUNDHOLDER_OFFSET) : nullptr;
+    void* tmpl   = (holder && p_GetRound) ? p_GetRound(holder, 0, nullptr) : nullptr; // peek a shell in the tube for its type
+    bool  result = LRFRC_orig(self, carrier, method);                                 // chamber off the lifter
+    if (result && tmpl) {
+        topUp(holder, tmpl);                                                          // keep the tube full (lifter untouched)
+        if (!g_loggedTube) { LOGI("pump/tube: fed + topped up connected tube magazine"); g_loggedTube = true; }
     }
     return result;
 }
@@ -171,6 +237,19 @@ static bool SpawnLockAllowed_hook(void* method) {
     return true;
 }
 
+// No recoil: every felt-recoil kick reaches the held firearm through the Recoil MonoBehaviour's
+// four public impulse methods. We replace all four with a no-op that neither applies the impulse
+// nor calls the original, so the recoil simulation never gets anything to integrate -> zero kick
+// and zero muzzle climb, universally. Blowback/bolt cycling is driven by the breech's own
+// momentum, not this component, so semi/full-auto keep cycling. One shared detour covers all four;
+// the orig trampolines are never called. Vector3 args ride in SIMD regs and AArch64 is
+// caller-cleaned, so ignoring them here is ABI-safe.
+static void* g_recoilOrig[4] = { nullptr, nullptr, nullptr, nullptr };
+static bool  g_loggedRecoil  = false;
+static void NoRecoil_hook(void* /*self*/) {
+    if (!g_loggedRecoil) { LOGI("no-recoil: impulse swallowed"); g_loggedRecoil = true; }
+}
+
 static bool g_installed = false;
 static void installAll(const char* via) {
     if (g_installed) return;
@@ -190,6 +269,26 @@ static void installAll(const char* via) {
                                            reinterpret_cast<uint32_t*>(target), reinterpret_cast<void**>(&LRFM_orig),
                                            10, FLAMINGO_CDECL, nameInfo, priority, meta);
     LOGI("feed hook %s at %p", res.result == FLAMINGO_INSTALL_OK ? "installed" : "FAILED", target);
+
+    // ---- bolt-action / pump feed hook (separate breech class) ----
+    void* oTarget   = real(RVA_LoadRoundFromOwnMag);
+    auto  oName     = flamingo_make_name("LoadRoundFromOwnMag");
+    auto  oPriority = flamingo_make_priority(nullptr, 0, nullptr, 0, false);
+    auto  oMeta     = flamingo_make_install_metadata(true, false, true);
+    auto  oRes = flamingo_install_hook_full(reinterpret_cast<void*>(&LoadRoundFromOwnMagazine_hook),
+                                            reinterpret_cast<uint32_t*>(oTarget), reinterpret_cast<void**>(&LRFOM_orig),
+                                            10, FLAMINGO_CDECL, oName, oPriority, oMeta);
+    LOGI("bolt/pump feed hook %s at %p", oRes.result == FLAMINGO_INSTALL_OK ? "installed" : "FAILED", oTarget);
+
+    // ---- pump/tube shotgun feed hook (shell lifter / round carrier, CyclicBolt breech) ----
+    void* tTarget   = real(RVA_LoadRoundFromCarrier);
+    auto  tName     = flamingo_make_name("LoadRoundFromCarrier");
+    auto  tPriority = flamingo_make_priority(nullptr, 0, nullptr, 0, false);
+    auto  tMeta     = flamingo_make_install_metadata(true, false, true);
+    auto  tRes = flamingo_install_hook_full(reinterpret_cast<void*>(&LoadRoundFromRoundCarrier_hook),
+                                            reinterpret_cast<uint32_t*>(tTarget), reinterpret_cast<void**>(&LRFRC_orig),
+                                            10, FLAMINGO_CDECL, tName, tPriority, tMeta);
+    LOGI("pump/carrier feed hook %s at %p", tRes.result == FLAMINGO_INSTALL_OK ? "installed" : "FAILED", tTarget);
 
     // ---- breach-loader hook ----
     p_GetLoadedRounds = reinterpret_cast<GetLoadedRounds_t>(real(RVA_GetLoadedRounds));
@@ -231,6 +330,23 @@ static void installAll(const char* via) {
                                             reinterpret_cast<uint32_t*>(sTarget), reinterpret_cast<void**>(&SLA_orig),
                                             10, FLAMINGO_CDECL, sName, sPriority, sMeta);
     LOGI("spawnlock hook %s at %p", sRes.result == FLAMINGO_INSTALL_OK ? "installed" : "FAILED", sTarget);
+
+    // ---- no recoil: swallow all four Recoil impulse entry points ----
+    {
+        const std::uintptr_t rva[4]  = { RVA_RecoilAtPos, RVA_RecoilLinear, RVA_RecoilAngular, RVA_RecoilLinAng };
+        const char*          name[4] = { "RecoilAtPos", "RecoilLinear", "RecoilAngular", "RecoilLinAng" };
+        int ok = 0;
+        for (int i = 0; i < 4; ++i) {
+            auto pr = flamingo_make_priority(nullptr, 0, nullptr, 0, false);
+            auto mt = flamingo_make_install_metadata(true, false, true);
+            auto r  = flamingo_install_hook_full(reinterpret_cast<void*>(&NoRecoil_hook),
+                                                 reinterpret_cast<uint32_t*>(real(rva[i])),
+                                                 reinterpret_cast<void**>(&g_recoilOrig[i]),
+                                                 10, FLAMINGO_CDECL, flamingo_make_name(name[i]), pr, mt);
+            if (r.result == FLAMINGO_INSTALL_OK) ok++;
+        }
+        LOGI("no-recoil hooks installed %d/4", ok);
+    }
 }
 
 // libil2cpp isn't mapped yet at dlopen; poll on a detached pthread, then install.

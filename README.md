@@ -1,8 +1,8 @@
-# H3VR2 Infinite Ammo (+ Quickbelt Duplication)
+# H3VR2 Infinite Ammo (+ No Recoil + Quickbelt Duplication)
 
 A native IL2CPP mod for **Hot Dogs, Horseshoes & Hand Grenades 2** ("Footlong",
-`com.rustltd.h3vr2`) on **Meta Quest 3**. It gives every firearm type infinite ammo and
-re-enables the game's own quickbelt duplication feature.
+`com.rustltd.h3vr2`) on **Meta Quest 3**. It gives every firearm type infinite ammo, removes
+felt recoil, and re-enables the game's own quickbelt duplication feature.
 
 Built directly on **[Scotland2](https://github.com/sc2ad/scotland2)** +
 **[flamingo](https://github.com/QuestPackageManager/Flamingo)** — no BeatSaber‑Hook — because
@@ -22,7 +22,9 @@ Each gun family feeds differently, so each gets its own narrow hook:
 
 | Gun family | Mechanism |
 |---|---|
-| **Magazine-fed / bolt** | Hook `CyclicBolt.Breech.LoadRoundFromMagazine`; after each feed, mint a **fresh** `RoundData` of the same type back into the magazine so it never empties. |
+| **Magazine-fed / self-loading** | Hook `CyclicBolt.Breech.LoadRoundFromMagazine`; after each feed, mint a **fresh** `RoundData` of the same type back into the magazine so it never empties. |
+| **Bolt-action** | A different breech class (`BoltAction.BoltActionBreech`): hook `LoadRoundFromOwnMagazine` and top its connected magazine back up the same way. |
+| **Pump / tube shotgun** | Chambers off a shell lifter (`MagazineCarrierLifter.RoundCarrier`): hook `CyclicBolt.Breech.LoadRoundFromRoundCarrier` and top up the lifter's **upstream tube magazine** (`RoundCarrier.connectedMagazine`) — never the lifter itself, which would make the gun re-chamber continuously and spawn duplicate round objects. |
 | **Breach / break-action / derringer / trapdoor / rolling- & falling-block** | Hook `BreachLoadingFirearm.HammerImpact`; after the shot, walk the loaded rounds and flip `fired` back to `false` so the chambered round never spends. |
 | **Revolver** | Cache the `Revolver` class on spawn (`Awake`), then at the universal `FirearmBase.Fire` chokepoint un-spend the fired chamber's round — but **only** when the firearm is actually a revolver, so nothing else is touched. |
 
@@ -30,6 +32,14 @@ Minting fresh rounds (rather than recycling instances) is deliberate: it avoids 
 where a reused `RoundData` goes spent on both the magazine copy and the chambered copy (one shot,
 then endless empty casings), and it leaves manual unloading untouched (no duplicate spent rounds
 jamming the extractor).
+
+### No recoil
+Every gun's felt kick and muzzle climb flows through the `Recoil` component's four public impulse
+methods (`AddRecoilImpulseAtPosition`, `AddRecoilLinearImpulse`, `AddRecoilAngularImpulse`,
+`AddRecoilLinearAndAngularImpulse`). The mod no-ops all four, so the recoil simulation never
+integrates any impulse — **zero kick, zero climb, for every firearm at once**. This is *felt*
+recoil only: blowback and bolt cycling run off the breech's own momentum, so semi- and full-auto
+guns still cycle normally.
 
 ### Quickbelt duplication ("spawn lock")
 H3VR2 **already ships** the first game's duplication feature on the `Pocket` class
@@ -118,6 +128,8 @@ RVAs are the `dump.cs` **RVA** field (not the file Offset), added to the libil2c
 | Const | RVA | Target |
 |---|---|---|
 | `RVA_LoadRoundFromMag` | `0x4E7D604` | `CyclicBolt.Breech.LoadRoundFromMagazine(Magazine,int)` |
+| `RVA_LoadRoundFromOwnMag` | `0x4E6E30C` | `BoltAction.BoltActionBreech.LoadRoundFromOwnMagazine(int)` |
+| `RVA_LoadRoundFromCarrier` | `0x4E7DA44` | `CyclicBolt.Breech.LoadRoundFromRoundCarrier(RoundCarrier)` |
 | `RVA_GetRound` | `0x4E348D0` | `RoundHolder.GetRound(int)` |
 | `RVA_LoadRound` | `0x4E34954` | `RoundHolder.LoadRound(RoundData)` |
 | `RVA_RoundDataCtor` | `0x4E31BB4` | `RoundData..ctor(ItemDef)` |
@@ -128,9 +140,14 @@ RVAs are the `dump.cs` **RVA** field (not the file Offset), added to the libil2c
 | `RVA_RevolverAwake` | `0x4E21DE8` | `Revolver.Awake()` |
 | `RVA_ChamberLoadedRnd` | `0x4E6B878` | `Chamber.LoadedRound()` |
 | `RVA_SpawnLockAllowed` | `0x4C76E8C` | `Pocket.SpawnLockAllowed()` (static gate) |
+| `RVA_RecoilAtPos` | `0x4E179C0` | `Recoil.AddRecoilImpulseAtPosition(Vector3,Vector3)` |
+| `RVA_RecoilLinear` | `0x4E1D650` | `Recoil.AddRecoilLinearImpulse(Vector3)` |
+| `RVA_RecoilAngular` | `0x4E1D8F0` | `Recoil.AddRecoilAngularImpulse(Vector3)` |
+| `RVA_RecoilLinAng` | `0x4E1DB6C` | `Recoil.AddRecoilLinearAndAngularImpulse(Vector3,Vector3)` |
 
-Struct offsets: `Magazine.roundHolder 0x260`, `RoundData.def 0x10`, `RoundData.fired 0x20`,
-`Il2CppArray` count `0x18` / vector `0x20` (64-bit).
+Struct offsets: `Magazine.roundHolder 0x260`, `BoltAction.BoltActionBreech.connectedMagazine 0x60`,
+`MagazineCarrierLifter.RoundCarrier.connectedMagazine 0x20`, `RoundData.def 0x10`,
+`RoundData.fired 0x20`, `Il2CppArray` count `0x18` / vector `0x20` (64-bit).
 
 ### Updating offsets
 On a game update, re-dump with [Il2CppDumper](https://github.com/Perfare/Il2CppDumper)
