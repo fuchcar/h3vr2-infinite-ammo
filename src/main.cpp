@@ -39,8 +39,10 @@
 // ammo, grenades, toys and powerups can be duplicated.
 //
 // No recoil: the Recoil component applies felt kick + muzzle climb through four public impulse
-// methods; we no-op all four so the recoil sim never integrates anything. This is felt recoil
-// only -- blowback/bolt cycling runs off the breech's own momentum, so auto guns still cycle.
+// methods; we hook all four and, with no-recoil enabled (the default), swallow their impulses so
+// the sim never integrates anything -- a runtime flag (g_noRecoil) can forward to the original to
+// restore real recoil. This is felt recoil only: blowback/bolt cycling runs off the breech's own
+// momentum, so auto guns still cycle either way.
 //
 // All addresses are the dump.cs RVA field, added to the libil2cpp.so load base.
 
@@ -132,6 +134,8 @@ static bool              g_loggedRevolver  = false;
 static bool              g_loggedSpawnLock = false;
 static bool              g_loggedBolt      = false;
 static bool              g_loggedTube      = false;
+static bool              g_infAmmo         = true;  // cheat toggle: infinite ammo (default on)
+static bool              g_dupe            = true;  // cheat toggle: quickbelt duplication (default on)
 
 // Mint a fresh live RoundData of the same type as `tmpl` and drop it into `holder`.
 static void topUp(void* holder, void* tmpl) {
@@ -149,7 +153,7 @@ static bool LoadRoundFromMagazine_hook(void* self, void* mag, int index, void* m
     void* holder = mag ? *reinterpret_cast<void**>(reinterpret_cast<char*>(mag) + MAG_ROUNDHOLDER_OFFSET) : nullptr;
     void* tmpl   = (holder && p_GetRound) ? p_GetRound(holder, 0, nullptr) : nullptr; // peek a round for its type
     bool  result = LRFM_orig(self, mag, index, method);                               // let the bolt feed (depletes mag by 1)
-    if (result && tmpl) {
+    if (g_infAmmo && result && tmpl) {
         topUp(holder, tmpl);                                                          // replace it with a fresh live round
         if (!g_logged) { LOGI("fed + topped up magazine with a fresh round"); g_logged = true; }
     }
@@ -167,7 +171,7 @@ static bool LoadRoundFromOwnMagazine_hook(void* self, int index, void* method) {
     void* holder = mag  ? *reinterpret_cast<void**>(reinterpret_cast<char*>(mag) + MAG_ROUNDHOLDER_OFFSET) : nullptr;
     void* tmpl   = (holder && p_GetRound) ? p_GetRound(holder, 0, nullptr) : nullptr; // peek a round for its type
     bool  result = LRFOM_orig(self, index, method);                                   // let the cycle chamber (depletes mag by 1)
-    if (result && tmpl) {
+    if (g_infAmmo && result && tmpl) {
         topUp(holder, tmpl);                                                          // replace it with a fresh live round
         if (!g_loggedBolt) { LOGI("bolt/pump: fed + topped up connected magazine"); g_loggedBolt = true; }
     }
@@ -189,7 +193,7 @@ static bool LoadRoundFromRoundCarrier_hook(void* self, void* carrier, void* meth
     void* holder = mag     ? *reinterpret_cast<void**>(reinterpret_cast<char*>(mag) + MAG_ROUNDHOLDER_OFFSET) : nullptr;
     void* tmpl   = (holder && p_GetRound) ? p_GetRound(holder, 0, nullptr) : nullptr; // peek a shell in the tube for its type
     bool  result = LRFRC_orig(self, carrier, method);                                 // chamber off the lifter
-    if (result && tmpl) {
+    if (g_infAmmo && result && tmpl) {
         topUp(holder, tmpl);                                                          // keep the tube full (lifter untouched)
         if (!g_loggedTube) { LOGI("pump/tube: fed + topped up connected tube magazine"); g_loggedTube = true; }
     }
@@ -200,7 +204,7 @@ static bool LoadRoundFromRoundCarrier_hook(void* self, void* carrier, void* meth
 // gun keeps firing live with no reload.
 static void HammerImpact_hook(void* self, int index, bool fire, void* method) {
     HI_orig(self, index, fire, method);                         // let the shot happen first
-    if (!fire || !self || !p_GetLoadedRounds) return;
+    if (!g_infAmmo || !fire || !self || !p_GetLoadedRounds) return;
     void* arr = p_GetLoadedRounds(self, nullptr);               // RoundData[] of chambered rounds
     if (!arr) return;
     uint32_t n = *reinterpret_cast<uint32_t*>(reinterpret_cast<char*>(arr) + ARRAY_COUNT_OFFSET);
@@ -222,7 +226,7 @@ static void RevolverAwake_hook(void* self, void* method) {
 // the chamber that just fired so the cylinder never empties.
 static void Fire_hook(void* self, void* chamber, void* barrel, void* method) {
     Fire_orig(self, chamber, barrel, method);
-    if (!self || !chamber || !g_revolverClass || !p_LoadedRound) return;
+    if (!g_infAmmo || !self || !chamber || !g_revolverClass || !p_LoadedRound) return;
     if (*reinterpret_cast<void**>(self) != g_revolverClass) return;   // revolvers only
     void* round = p_LoadedRound(chamber, nullptr);
     if (!g_loggedRevolver) { LOGI("revolver Fire: round=%p", round); g_loggedRevolver = true; }
@@ -232,23 +236,31 @@ static void Fire_hook(void* self, void* chamber, void* barrel, void* method) {
 // Re-enable the game's built-in quickbelt duplication by forcing its game-mode gate open.
 // Per-item/per-pocket rules still apply, so guns stay non-dupeable.
 static bool SpawnLockAllowed_hook(void* method) {
-    (void)method;
+    if (!g_dupe) return SLA_orig(method);   // toggle off -> real game-mode gate
     if (!g_loggedSpawnLock) { LOGI("spawnlock gate forced open"); g_loggedSpawnLock = true; }
     return true;
 }
 
-// No recoil: every felt-recoil kick reaches the held firearm through the Recoil MonoBehaviour's
-// four public impulse methods. We replace all four with a no-op that neither applies the impulse
-// nor calls the original, so the recoil simulation never gets anything to integrate -> zero kick
-// and zero muzzle climb, universally. Blowback/bolt cycling is driven by the breech's own
-// momentum, not this component, so semi/full-auto keep cycling. One shared detour covers all four;
-// the orig trampolines are never called. Vector3 args ride in SIMD regs and AArch64 is
-// caller-cleaned, so ignoring them here is ABI-safe.
-static void* g_recoilOrig[4] = { nullptr, nullptr, nullptr, nullptr };
-static bool  g_loggedRecoil  = false;
-static void NoRecoil_hook(void* /*self*/) {
-    if (!g_loggedRecoil) { LOGI("no-recoil: impulse swallowed"); g_loggedRecoil = true; }
-}
+// No recoil (felt kick + muzzle climb only; blowback/bolt cycling is unaffected, so auto guns
+// still cycle). Each of the Recoil component's four impulse entry points is hooked with its matching signature
+// so we can either swallow the impulse (no recoil) or forward it to the original (normal recoil),
+// switched at runtime by g_noRecoil. Vector3 is an HFA of three floats (passed in SIMD regs), so a
+// plain {float x,y,z;} by value matches the ABI for forwarding to orig.
+struct V3 { float x, y, z; };
+typedef void (*RAtPos_t)(void* self, V3 pos, V3 imp, void* m);
+typedef void (*RLin_t)(void* self, V3 v, void* m);
+typedef void (*RAng_t)(void* self, V3 v, void* m);
+typedef void (*RLinAng_t)(void* self, V3 lin, V3 ang, void* m);
+static RAtPos_t  RAtPos_orig  = nullptr;
+static RLin_t    RLin_orig    = nullptr;
+static RAng_t    RAng_orig    = nullptr;
+static RLinAng_t RLinAng_orig = nullptr;
+static bool g_noRecoil     = true;   // runtime toggle; default on = felt recoil removed (current behavior)
+static bool g_loggedRecoil = false;
+static void RAtPos_hook (void* s, V3 p, V3 i, void* m) { if (g_noRecoil) { if (!g_loggedRecoil) { LOGI("no-recoil: impulse swallowed"); g_loggedRecoil = true; } return; } RAtPos_orig(s, p, i, m); }
+static void RLin_hook   (void* s, V3 v, void* m)       { if (g_noRecoil) return; RLin_orig(s, v, m); }
+static void RAng_hook   (void* s, V3 v, void* m)       { if (g_noRecoil) return; RAng_orig(s, v, m); }
+static void RLinAng_hook(void* s, V3 l, V3 a, void* m) { if (g_noRecoil) return; RLinAng_orig(s, l, a, m); }
 
 static bool g_installed = false;
 static void installAll(const char* via) {
@@ -331,20 +343,15 @@ static void installAll(const char* via) {
                                             10, FLAMINGO_CDECL, sName, sPriority, sMeta);
     LOGI("spawnlock hook %s at %p", sRes.result == FLAMINGO_INSTALL_OK ? "installed" : "FAILED", sTarget);
 
-    // ---- no recoil: swallow all four Recoil impulse entry points ----
+    // ---- no recoil: four impulse entry points, each gated on g_noRecoil ----
     {
-        const std::uintptr_t rva[4]  = { RVA_RecoilAtPos, RVA_RecoilLinear, RVA_RecoilAngular, RVA_RecoilLinAng };
-        const char*          name[4] = { "RecoilAtPos", "RecoilLinear", "RecoilAngular", "RecoilLinAng" };
+        auto pr = flamingo_make_priority(nullptr, 0, nullptr, 0, false);
+        auto mt = flamingo_make_install_metadata(true, false, true);
         int ok = 0;
-        for (int i = 0; i < 4; ++i) {
-            auto pr = flamingo_make_priority(nullptr, 0, nullptr, 0, false);
-            auto mt = flamingo_make_install_metadata(true, false, true);
-            auto r  = flamingo_install_hook_full(reinterpret_cast<void*>(&NoRecoil_hook),
-                                                 reinterpret_cast<uint32_t*>(real(rva[i])),
-                                                 reinterpret_cast<void**>(&g_recoilOrig[i]),
-                                                 10, FLAMINGO_CDECL, flamingo_make_name(name[i]), pr, mt);
-            if (r.result == FLAMINGO_INSTALL_OK) ok++;
-        }
+        auto r1 = flamingo_install_hook_full((void*)&RAtPos_hook,  (uint32_t*)real(RVA_RecoilAtPos),   (void**)&RAtPos_orig,  10, FLAMINGO_CDECL, flamingo_make_name("RecoilAtPos"),  pr, mt); if (r1.result == FLAMINGO_INSTALL_OK) ok++;
+        auto r2 = flamingo_install_hook_full((void*)&RLin_hook,    (uint32_t*)real(RVA_RecoilLinear),  (void**)&RLin_orig,    10, FLAMINGO_CDECL, flamingo_make_name("RecoilLinear"), pr, mt); if (r2.result == FLAMINGO_INSTALL_OK) ok++;
+        auto r3 = flamingo_install_hook_full((void*)&RAng_hook,    (uint32_t*)real(RVA_RecoilAngular), (void**)&RAng_orig,    10, FLAMINGO_CDECL, flamingo_make_name("RecoilAngular"),pr, mt); if (r3.result == FLAMINGO_INSTALL_OK) ok++;
+        auto r4 = flamingo_install_hook_full((void*)&RLinAng_hook, (uint32_t*)real(RVA_RecoilLinAng),  (void**)&RLinAng_orig, 10, FLAMINGO_CDECL, flamingo_make_name("RecoilLinAng"),pr, mt); if (r4.result == FLAMINGO_INSTALL_OK) ok++;
         LOGI("no-recoil hooks installed %d/4", ok);
     }
 }
