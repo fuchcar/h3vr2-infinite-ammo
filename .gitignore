@@ -1,0 +1,16 @@
+# build output
+build/
+build_log.txt
+
+# qpm-restored dependencies and generated files (run `qpm restore` to regenerate)
+extern/
+include/
+ndkpath.txt
+extern.cmake
+qpm_defines.cmake
+
+# generated from mod.template.json by `qpm qmod manifest`
+mod.json
+
+# stray archives
+*.zip

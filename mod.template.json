@@ -1,0 +1,18 @@
+{
+  "$schema": "https://raw.githubusercontent.com/Lauriethefish/QuestPatcher.QMod/main/QuestPatcher.QMod/Resources/qmod.schema.json",
+  "_QPVersion": "0.1.1",
+  "name": "H3VR2 Infinite Ammo",
+  "id": "${mod_id}",
+  "author": "fuchcar",
+  "version": "${version}",
+  "modloader": "Scotland2",
+  "packageId": "com.rustltd.h3vr2",
+  "packageVersion": "20261115D",
+  "description": "Native IL2CPP mod for H3VR2 (Footlong): infinite ammo for every firearm type (magazine-fed, breach/derringer, revolver) and re-enables the game's built-in quickbelt duplication. Built on Scotland2 + flamingo.",
+  "coverImage": null,
+  "dependencies": [],
+  "modFiles": [],
+  "lateModFiles": [],
+  "libraryFiles": [ "${binary}" ],
+  "fileCopies": []
+}
